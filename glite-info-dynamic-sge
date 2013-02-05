@@ -1,0 +1,1185 @@
+#! /usr/bin/perl
+#use diagnostics;
+
+# If you modify this script locally,  please append a suitable suffix
+# to this version string
+
+use constant VERSION => '0.903';
+
+# See LICENSE - licensing information.
+# See CREDITS - attributions.
+# See AUTHORS - information about the maintainers
+
+# --- Compiler directives ------------------------------------------------
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use IO::File;
+use IO::Pipe;
+use POSIX qw( strftime );
+use XML::Twig;
+use Time::Local;
+
+#
+# --- Constants ----------------------------------------------------------
+#
+
+use constant BLAH_VERSION  => 1005019;
+
+use constant BLAH_QUEUED   => 1;
+use constant BLAH_RUNNING  => 2;
+use constant BLAH_DELETED  => 3;
+use constant BLAH_FINISHED => 4;
+use constant BLAH_HELD     => 5;
+
+
+#
+# --- Globals ------------------------------------------------------------
+#
+
+my ( @BLAH_STATES ) = qw( unknown queued running done done pending );
+
+my ( @MONTHS ) =qw( Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec );
+my ( %MONTHS ) = map( ( $MONTHS[$_] => $_ + 1 ), 0 .. $#MONTHS );
+my ( $MONTHPAT ) = join('|',@MONTHS );
+
+my %NUMERIC = qw( qtime %.1f start %.1f cpucount %d maxwalltime %.1f );
+
+my $CLASSAD;
+my $QSTAT;
+my $QACCT;
+my $LRMS;
+my $INFO;
+my $VOMAXJOBS;
+my $ALL;
+my $GETWORKERNODE;
+my $CELL = $ENV{'SGE_CELL'} || 'default';
+my $SGEROOT;
+my $PRINTENV;
+my $LRMSINFO_CONFIG_FILE;
+
+my $USED_cpus = 0;
+my %HOST_freecpus;
+
+my $DEFAULT_CONFIG_FILE        = '/etc/lrms/sge.conf';
+my $DEFAULT_LRMS_CONFIG_FILE   = '/etc/lcg-info-dynamic-scheduler.conf';
+my $DEFAULT_VQUEUE_FILE        = '/etc/lrms/vqueues.conf';
+
+my %NEEDED_RESOURCEINFO;
+
+my ( @DNs, %QUEUE_vos, %VO_queues );
+my %VOGROUPS;
+my @OS;
+
+my ( @VQUEUES, %VQUEUE );
+
+my ( %QUEUE_minlimits );
+my ( %QUEUE_maxwalltime );
+my ( %QUEUE_counts );
+
+my ( %passwd_file_cache, %group_file_cache, %group_cache );
+
+my ( %VO_FROM_GROUP );
+my ( %VO_FROM_LOGIN );
+my ( %VO_TO_QUEUE );
+
+my ( %CONFIG );
+
+my ( %FILEPROCESSED );
+
+my @ManagerDNs;         # A dn found in the static Glue2 manager ldif file
+my @ShareDNs;           # A dn found in the static Glue2 share ldif file
+
+# Path to static LDIF file
+$CONFIG{'glue1-static-file-ce'}                = '/var/lib/bdii/gip/ldif/static-file-CE.ldif';
+$CONFIG{'glue2-static-file-computing-manager'} = '/var/lib/bdii/gip/ldif/ComputingManager.ldif';
+$CONFIG{'glue2-static-file-computing-share'}   = '/var/lib/bdii/gip/ldif/ComputingShare.ldif';
+
+$CONFIG{'outputformat'}         = undef;
+
+# Path to SGE jobmanager virtual queue mapping configuration file.
+$CONFIG{'vqueue_file'}          = undef;
+
+# Time
+$CONFIG{'time'}                 = time;
+
+# Path to file defining current cluster state.
+# (One of 'Production', 'Draining', 'Queueing', 'Closed')
+$CONFIG{'state_file'}           = '/etc/lrms/cluster.state';
+
+# Regexp values for matching/excluding queues to be considered
+$CONFIG{'queue_include_regexp'} = undef;
+$CONFIG{'queue_exclude_regexp'} = undef;
+
+# Regexp values for matching/excluding users to be considered
+
+# Estimated efficiency of a typical job... for converting between wallclock & cputime
+$CONFIG{'job_efficiency'}       = 0.9;
+
+# IF not set in the config, the default values are calculated after the
+# config has been parsed as they are based on other config values
+$CONFIG{'qselect_command'}      = undef;
+$CONFIG{'qstat_command'}        = undef;
+$CONFIG{'qconf_command'}        = undef;
+
+# Max Wallclock time for a job if one can't be determined
+# If set in the config file or command line, the value is passed through
+# timeValueToSeconds before being assigned
+# FIXME:  This could perhaps be picked up from the "qconf -sconf" default_duration
+$CONFIG{'default_duration'}     = 7 * 24 * 60 * 60;
+$CONFIG{'max_duration'}         = 21 * 24 * 60 * 60;
+
+$CONFIG{'passwd_file'}          = undef;
+$CONFIG{'group_file'}           = undef;
+
+$CONFIG{'clusterstate'}         = 'Production';
+
+## Cache
+$CONFIG{'cache_dir'}            = undef;
+$CONFIG{'cache_expiration'}     = undef;
+
+# Config options that are not currently supported
+my %IGNORECONFIG;
+$IGNORECONFIG{'user_include_regexp'} = 1;
+$IGNORECONFIG{'user_exclude_regexp'} = 1;
+$IGNORECONFIG{'date_command'}   = 1;  
+$IGNORECONFIG{'capture_file'}  = 1;
+
+my %SGE;
+
+
+#
+# --- Command line args ------------------------------------------------------------
+#
+
+if ( $0 =~ /^(.*\/)?lrmsinfo\-sge$/ )  { unshift( @ARGV, '--lrmsinfo' );
+} elsif ( $0 =~ /^(.*\/)?lcg\-info\-dynamic\-sge$/ )      { unshift( @ARGV, '--info' );
+} elsif ( $0 =~ /^(.*\/)?vomaxjobs\-sge$/ ) { unshift( @ARGV, '--vomaxjobs' );
+}
+
+#die "ARGS:\n", map( "\"$_\"\n", $0, @ARGV );
+
+GetOptions(
+#    'status'          => sub { $QSTAT = 1; $QACCT = 1; $CLASSAD = 1; },
+#    'qstat'           => sub { $QSTAT = 1; $GETWORKERNODE = 1; },
+#    'qacct'           => sub { $QACCT = 1; $GETWORKERNODE = 1; },
+    'lrmsinfo'        => sub { $QSTAT = 1; $LRMS = 1; $ALL = 1 },
+    'vomaxjobs'       => sub { $QSTAT = 1; $VOMAXJOBS = 1; $ALL = 1; },
+    'info'            => sub { $QSTAT = 1; $INFO = 1; $ALL = 1 },
+#    'getworkernodes'  => \$GETWORKERNODE,
+#    'all'             => \$ALL,
+    'cell|sgecell=s'  => \$CELL,
+    'sgeroot=s'       => \$SGEROOT,
+    'printenv' 	      => \$PRINTENV,
+    'groupmap=s'      => sub { &read_map_file( $_[1], 0, 1, 3, \%group_cache ); },
+    'passwdfile=s'    => sub { &read_map_file( $_[1], 0, 3, 5, \%passwd_file_cache ); },
+    'groupfile=s'     => sub { &read_map_file( $_[1], 2, 0, 4, \%group_file_cache ); },
+    'vqueues=s'       => \$CONFIG{'vqueue_file'},
+    'config|c=s'        => sub { \&read_config_file( $_[1] ); },
+) or die "$0: usage\n";
+
+
+#
+# --- Main ------------------------------------------------------------
+#
+
+if ( $PRINTENV ) {
+	if ( my $file = &run_sge_command( $CELL, undef, '/usr/bin/printenv' ) ) {
+		while ( $_ = $file->getline ) {
+			print;
+		}
+		$file->close;
+	}
+	exit( 0 );
+}
+
+# TODO: Read accounting file directly rather than via qacct
+#       so that we only need to read through the accounting file once?
+#
+#       Cope with archiving strategies for accounting data?
+
+my ( $index ) = 0;
+my ( %joblist );
+
+foreach ( @ARGV ) {
+    die "Unparsable job id\n" 
+	unless m~^((\d+)/)?((\d+)\.(.+))$~;
+
+    $joblist{$5}->{$4} = [ $index++, $2, $4, $5 ];
+}
+
+my @results;
+my %results;
+
+if ( $INFO || $LRMS ) {
+    # Needed to calculate maxwalltime values
+    $NEEDED_RESOURCEINFO{'h_rt'}++;    
+    $NEEDED_RESOURCEINFO{'s_rt'}++;
+}
+
+if ( $INFO ) {
+    # Needed to calculate maxcputime values
+    $NEEDED_RESOURCEINFO{'h_cpu'}++;    
+    $NEEDED_RESOURCEINFO{'s_cpu'}++;
+}
+
+if ( $INFO || $VOMAXJOBS || $LRMS ) {
+    # Needed to calculate freeslots
+    $NEEDED_RESOURCEINFO{'num_procs'}++;
+    $NEEDED_RESOURCEINFO{'slots'}++;
+}
+
+if ( $QSTAT || $INFO || $VOMAXJOBS ) {
+    &read_config_file( $DEFAULT_CONFIG_FILE ) if defined( $DEFAULT_CONFIG_FILE ) && -f $DEFAULT_CONFIG_FILE;
+    &read_config_file( $DEFAULT_LRMS_CONFIG_FILE ) if defined( $DEFAULT_LRMS_CONFIG_FILE ) && -f $DEFAULT_LRMS_CONFIG_FILE;
+    &read_ldif_file( $CONFIG{'glue1-static-file-ce'} ) if $CONFIG{'outputformat'} =~ m/glue1/i;
+    if ( $CONFIG{'outputformat'} =~ m/glue2/i ) {
+        &read_ldif_file( $CONFIG{'glue2-static-file-computing-manager'} );
+        &read_ldif_file( $CONFIG{'glue2-static-file-computing-share'} );
+    }
+    if ( $CONFIG{'outputformat'} =~ m/both/i ) {
+        &read_ldif_file( $CONFIG{'glue1-static-file-ce'} );
+        &read_ldif_file( $CONFIG{'glue2-static-file-computing-manager'} );
+        &read_ldif_file( $CONFIG{'glue2-static-file-computing-share'} );
+    }
+    &read_vqueue_file();
+}
+
+if ( $QSTAT ) {
+    my ( @cells) = ( $ALL ? ( $CELL ) : keys %joblist );
+    my ( $needed_resourceinfo ) = join( ',', keys %NEEDED_RESOURCEINFO );
+
+    foreach my $cell ( @cells ) {
+        &get_sge_version( $cell );
+        &get_sge_settings( $cell );
+        
+        my $do_caching = defined( $CONFIG{'cache_dir'} ) && defined( $CONFIG{'cache_expiration'} ); 
+        &get_qstat_data( $cell, $do_caching, $needed_resourceinfo );
+    }
+}
+
+if ( $INFO) {
+    ## GLUE1 ## 
+    print_glue_data("glue1-static-file-CE", @DNs); 
+ 
+    ## GLUE2 ##
+    print_glue_data("glue2-static-file-computing-manager", @ManagerDNs);
+    print_glue_data("glue2-static-file-computing-share", @ShareDNs);
+
+    exit( 0 );
+} 
+elsif ( $VOMAXJOBS ) {
+    my %SLOTTOTALS;
+
+    foreach my $vo ( keys %VOGROUPS ) {
+	    foreach my $grp ( keys %{$VOGROUPS{$vo}} ) {
+	        foreach my $q ( keys %{$VO_queues{$vo}} ) {
+		        foreach my $h ( keys( %{$QUEUE_counts{$q}} ) ) {
+		            $SLOTTOTALS{$grp} += $QUEUE_counts{$q}->{$h}->[1];
+		        }
+	        }
+	    }
+    }
+    
+    printf "{ %s }\n", join( ',', map( "'$_' : $SLOTTOTALS{$_}", keys %SLOTTOTALS ) );
+    
+    exit( 0 );
+}
+
+if ( $QACCT ) {
+    # For --qacct,   we are only concerned with requested jobs
+    foreach my $cell ( keys %joblist ) {
+        foreach my $jobid ( keys %{$joblist{$cell}} ) {
+            my $jl = $joblist{$cell}->{$jobid};
+
+            next unless $jl;
+            next if $results[ $jl->[0] ];
+            
+            my %jobinfo;
+
+            my $qacct = &run_sge_command( $cell, '2>&1', 'qacct', '-j', $jobid ) or die;
+
+            while ( defined( $_ = $qacct->getline ) ) {
+                if ( /^exit_status\s+(\d+)/ ) {
+                    $jobinfo{'BatchJobId'} = $jobid.'.'.$cell;
+                    $jobinfo{'ExitCode'} = $1;
+                    $jobinfo{'JobStatus'} = BLAH_FINISHED;
+                } 
+                elsif ( $CLASSAD && /^qsub_time\s+(.+)$/ ) {
+                    $jobinfo{'LRMSSubmissionTime'} = &convert_date( $1, 1 );
+                } 
+                elsif ( $CLASSAD && /^start_time\s+(.+)$/ ) {
+                    $jobinfo{'LRMSStartRunningTime'} = &convert_date( $1, 1 );
+                } 
+                elsif ( /^end_time\s+(.+)$/ ) {
+                    if ( $CLASSAD ) { 
+                        $jobinfo{'LRMSCompletedTime'} = &convert_date( $1, 1 );
+                    } 
+                    else {
+                        $jobinfo{'statechange'} = &convert_date( $1, 0 );
+                    }
+                } 
+                elsif ( $GETWORKERNODE && /^hostname\s+(\S+)$/ ) {
+                    $jobinfo{'WorkerNode'} = $1;
+                }
+            }
+            
+            $qacct->close();
+            
+            $results[$jl->[0]] = \%jobinfo;
+        }
+    }
+}
+
+my ( @KEYS ) = ( $CLASSAD ? qw( BatchJobId JobStatus ExitCode LRMSSubmissionTime LRMSStartRunningTime )
+		 : $LRMS  ? qw( group name qtime jobid queue start state cpucount user maxwalltime )
+		 :          qw( BatchJobId JobStatus ExitCode statuschange WorkerNode ) );
+
+push( @KEYS, 'WorkerNode' ) if $CLASSAD && $GETWORKERNODE;
+
+my $FMT = ( $CLASSAD ? [ "[ ", "", "]\n",  "Error\n", sub { sprintf( "%s = \"%s\";", @_ ); } ]
+	    : $LRMS  ? [ "{",  ", ", "}\n", "",       sub { ( $NUMERIC{$_[0]} ? sprintf( "'%s': ".$NUMERIC{$_[0]}, $_[0], $_[1] ) : sprintf( "'%s': '%s'", $_[0], &quote($_[1]) ) ); } ]
+	    :          [ "",   " ", "\n",  "",        sub { ( defined( $_[1] ) && $_[1] ne '' ? $_[1] : '-' ); } ] );
+
+if ( $LRMS ) {
+    my $FREE_cpus = 0;
+
+    foreach ( values %HOST_freecpus ) {
+	    $FREE_cpus += $_;
+    }
+
+    printf( "nactive\t%d\nnfree\t%d\nnow\t%s\nschedCycle\t%d\n",
+	    $USED_cpus + $FREE_cpus, 
+	    $FREE_cpus,
+	    $CONFIG{'time'},
+	    0 
+    );
+}
+
+if ( $LRMS || $CLASSAD ) {
+    foreach my $res ( @results ) {
+        if ( ! $res ) {
+            print $FMT->[3];
+        } 
+        else {
+            print $FMT->[0];
+            print join( $FMT->[1], map( &{$FMT->[4]}( $_, $res->{$_} ), grep( defined( $res->{$_} ), @KEYS ) ) );
+            print $FMT->[2];
+        }
+    }
+} else {
+    foreach my $res ( @results ) {
+        printf( "%s %d %d %s %s OK\n", 
+            $res->{'BatchJobId'}, 
+            $res->{'JobStatus'}, 
+            ( $res->{'ExitCode'} || 0 ),
+            $res->{'statuschange'},
+            ( $res->{'WorkerNode'} || '-' )
+        );
+    }
+}
+
+#
+# --- Methods ------------------------------------------------------------
+#
+
+sub print_glue_data {
+    my ( $type, @data ) = @_;
+
+    if ( $type eq "glue1-static-file-CE" || $type eq "glue2-static-file-computing-share" ) { 
+        
+        &read_clusterstate_file();
+        
+        foreach ( @data ) {
+            my ( $dn, $qname ) = @{$_};
+            my ( $maxwalltime ) = $QUEUE_minlimits{$qname}->{'rt'};
+            my ( $maxcputime  ) = $QUEUE_minlimits{$qname}->{'cpu'};
+            my ( @counts );
+
+            foreach my $c ( values %{$QUEUE_counts{$qname}} ) {
+                map( $counts[$_] += $c->[$_], 0 .. $#{$c} );
+            }
+
+            $maxwalltime = int( $maxcputime / ( $CONFIG{'job_efficiency'} || 1 ) ) if ! defined( $maxwalltime ) && defined( $maxcputime );
+            $maxwalltime = $CONFIG{'default_duration'} unless defined( $maxwalltime );
+
+            $maxcputime  = int( $maxwalltime * ( $CONFIG{'job_efficiency'} || 1 ) ) if ! defined( $maxcputime ) && defined( $maxwalltime );
+            $maxcputime  = 0 unless defined( $maxcputime );
+
+            # Sanity check
+            $maxcputime = $maxwalltime if defined( $maxcputime ) && defined( $maxwalltime ) && $maxcputime > $maxwalltime;    
+
+            if ( $type =~ m/glue1/i ) {
+                printf( "%s\n", $dn );
+                printf( "GlueCEInfoLRMSVersion: %s\n",        ( $SGE{$CELL}->{'version'} || 'unknown' ) );
+                printf( "GlueCEPolicyAssignedJobSlots: %d\n", ( $counts[1] || 0 ) );
+                printf( "GlueCEPolicyMaxTotalJobs: %d\n",     $SGE{$CELL}->{'max_jobs'} ) if $SGE{$CELL}->{'max_jobs'};
+                printf( "GlueCEPolicyMaxRunningJobs: %d\n",   ( $counts[0] || 0 ) );
+                printf( "GlueCEInfoTotalCPUs: %d\n",          ( $counts[1] || 0 ) );
+                printf( "GlueCEStateFreeJobSlots: %d\n",      ( $counts[2] || 0 ) );
+                printf( "GlueCEStateFreeCPUs: %d\n",          ( $counts[2] || 0 ) );
+                printf( "GlueCEPolicyMaxCPUTime: %d\n",       ( $maxcputime / 60 ) );
+                printf( "GlueCEPolicyMaxWallClockTime: %d\n", ( $maxwalltime / 60 ) );
+                printf( "GlueCEStateStatus: %s\n",            $CONFIG{'clusterstate'} );
+                print( "\n" );
+            }
+            elsif ( $type =~ m/glue2/i ) {
+                printf( "%s", $dn );
+                printf( "GLUE2ComputingShareMaxRunningJobs: %d\n", ( $counts[0] || 0 ) );
+                printf( "GLUE2ComputingShareMaxCPUTime: %s\n",     $maxcputime );
+                printf( "GLUE2ComputingShareMaxWallTime: %s\n",    $maxwalltime );
+                printf( "GLUE2ComputingShareServingState: %s\n",   $CONFIG{'clusterstate'} );
+                print( "\n" );
+            }
+        }
+    }
+    elsif ( $type eq "glue2-static-file-computing-manager" ) {
+        for ( @data ) {
+            printf( "%s", $_ );
+            printf( "GLUE2ManagerProductVersion: %s\n", $SGE{$CELL}->{'version'} );
+            print( "\n" );
+        }
+    }
+    else { 
+        printf( STDERR "GLUE version not known: %s\n", $type );
+    }
+}
+
+# Convert date from format returned by qstat to either
+# If $txtfmt    then format used for classads
+#               else seconds since 1970 (unixtime)
+
+sub convert_date {
+    my ( $date, $txtfmt ) = @_;
+    my ( $year, $month, $day, $hour, $min, $sec );
+
+    if ( ! $date ) {
+	    $year  = undef;
+    } 
+    elsif ( $date =~ m~^(\d{4})\-(\d{2})\-(\d{2})T(\d{2})\:(\d{2})\:(\d{2})$~ ) {
+        $year  = $1;
+        $month = $2;
+        $day   = $3;
+        $hour  = $4;
+        $min   = $5;
+        $sec   = $6;
+    } 
+    elsif ( $date =~ m~^(\d{2})/(\d{2})/(\d{4})\s+(\d{2})\:(\d{2})\:(\d{2})$~ ) {
+        $year  = $3;
+        $month = $1;
+        $day   = $2;
+        $hour  = $4;
+        $min   = $5;
+        $sec   = $6;
+    } 
+    elsif ( $date =~ m~(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})$~ ) {
+        $year  = $1;
+        $month = $2;
+        $day   = $3;
+        $hour  = $4;
+        $min   = $5;
+        $sec   = $6;
+    } 
+    elsif ( $date =~ m~(\d{4})(\d{2})(\d{2})$~ ) {
+        $year  = $1;
+        $month = $2;
+        $day   = $3;
+        $hour  = 0;
+        $min   = 0;
+        $sec   = 0;
+    } 
+    elsif ( $date =~ m~(Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+($MONTHPAT)\s+(\d{1,2})\s+(\d{2})\:(\d{2})\:(\d{2})\s+(\d{4})~ ) {
+        $year  = $7;
+        $month = $MONTHS{$2};
+        $day   = $3;
+        $hour  = $4;
+        $min   = $5;
+        $sec   = $6;
+    } 
+    elsif ( $date =~ /^(\d+)$/ ) {
+        ( $sec, $min, $hour, $day, $month, $year ) = localtime( $1 );
+        $month++; $year += 1900;
+    } 
+    elsif ( defined( $date ) && $date ne '' ) {
+	    die "cannot convert date: \"$date\"\n";
+    }
+
+    if ( $txtfmt ) {
+        $year = $year % 100;
+        ( $year, $day ) = ( $day, $year ) if BLAH_VERSION <= 1005019;
+        defined( $year ) ? sprintf( '%02u-%02u-%02u %02u:%02u:%02u', int($year), int($month), int($day), $hour, $min, $sec ) : '';
+    } 
+    else {
+	    defined( $year ) ? timelocal( $sec, $min, $hour, $day, $month - 1, $year - 1900 ) : 0;
+    }
+}
+
+
+# Populate the environment then run the command
+
+sub run_sge_command {
+    my ( $cell, $stderr, $command, @args ) = @_;
+
+    $command = $CONFIG{$command.'_command'} if $CONFIG{$command.'_command'};
+
+    my $pipe = new IO::Pipe;
+    my $pid  = fork;
+
+    die "unable to fork: $!\n" unless defined( $pid );
+
+    if ( $pid == 0 ) {
+        # child process
+
+        $pipe->writer();
+
+        open( STDIN, '/dev/null' ) or die "cannot setup stdin: $!\n";
+        POSIX::dup2( $pipe->fileno, 1 ) or die "cannot setup stdout: $!\n";
+
+        $pipe->close;
+
+        if ( defined( $stderr ) ) {
+            open( STDERR, ( $stderr eq '2>&1' ? '>& STDOUT' : "> $stderr" ) )
+            or die "cannot setup stderr: $!\n";
+        }
+
+        if ( $SGEROOT ) {
+            exec( '/bin/sh', '-c', '. '.$SGEROOT.'/'.$cell.'/common/settings.sh ; exec $0 "$@"', $command, @args );
+        } else {
+            $ENV{'SGE_CELL'} = $cell;
+            exec( $command, @args );
+        }
+        die "cannot exec $command: $!\n";
+    }
+    
+    $pipe->reader();
+    $pipe;
+}
+
+sub read_map_file {
+    my ( $filename, $idxcol, $valcol, $split, $reshash ) = @_;
+
+    open( FILE, $filename ) or die "cannot open $filename: $!\n";
+
+    while( <FILE> ) {
+        chomp;
+        my ( @cols ) = split( /\:/, $_, $split );
+        
+        $reshash->{$cols[$idxcol]} = $cols[$valcol];
+    }
+
+    close( FILE );
+}
+
+sub gen_lrmsinfo {
+    my ( $cell, $twig, $job ) = @_;
+    my ( %res );
+
+    my $jobid           = $job->field( 'JB_job_number' );
+    my $task            = $job->field( 'tasks' );
+    my $taskcount       = 1;
+    my $slots           = $job->field('slots');
+
+    my $user            = $job->field( 'JB_owner' ); 
+    my $group           = &lookup_group( $user );
+    my $qname           = &lookup_queue( $cell, $job, $group );
+
+    if ( defined( $task ) && $task ne '' ) {
+        $taskcount = 0;
+        $jobid .= '-'.$task;
+
+        foreach ( split( /,/, $task ) ) {
+            if ( /^(\d+)$/ ) {
+            $taskcount++;
+            } elsif ( /^(\d+)\-(\d+)\:(\d+)$/ 
+                  && $1 <= $2 && $3 > 0 ) {
+            $taskcount += int( ( $2 - $1 ) / $3 ) + 1;
+            } else {
+            warn "Failed to parse taskspec '$task', assuming single task.";
+            $taskcount++;
+            }
+        }
+    }
+    
+    if ( my $r = $results{$jobid}  ) {
+        # We have a parallel job that is actively running,  need to adjust existing info
+        $r->{'cpucount'}    += $slots * $taskcount;
+        $r->{'maxwalltime'} = &minval( $r->{'maxwalltime'}, &lookup_maxwalltime( $cell, $job, $qname ) );
+    } 
+    else {
+        my $submittime      = $job->field( 'JB_submission_time' );
+        my $starttime       = $job->field( 'JAT_start_time' );
+
+        $res{'user'}        = $user;
+        $res{'group'}       = $group;
+        $res{'name'}        = $job->field('JB_name');
+        $res{'qtime'}       = &convert_date($submittime,0) if $submittime;
+        $res{'jobid'}       = $jobid.'.'.$cell;
+        $res{'state'}       = $BLAH_STATES[ &lookup_jobstate( $job ) ];
+        $res{'start'}       = &convert_date($starttime,0) if $starttime;
+        $res{'queue'}       = $qname;
+        $res{'maxwalltime'} = &lookup_maxwalltime( $cell, $job, $qname );
+        $res{'cpucount'}    = $slots * $taskcount;
+        
+        push( @results, ( $results{$jobid} = \%res ) );
+    }
+ 
+    # Prevents scrip to work in XML::Twig 3.26
+    #    $twig->dispose;
+    1;
+}
+
+sub gen_classad {
+    my ( $cell, $twig, $job ) = @_;
+    my ( %res );
+
+    my $jobid = $job->field( 'JB_job_number' );
+    my $jl = $joblist{$cell}->{$jobid};
+
+    if ( $ALL || $jl ) {
+        my $submittime = $job->field('JB_submission_time') || ( defined( $jl ) ? $jl->[1] : 0 );
+        my $starttime  = $job->field('JAT_start_time' );
+        
+        $res{'BatchJobId'}  = $jobid.'.'.$cell;
+        $res{'JobStatus'}   = &lookup_jobstate( $job );
+        $res{'ExitCode'}    = 255 if $res{'JobStatus'} == BLAH_DELETED || $res{'JobStatus'} == BLAH_FINISHED;
+        $res{'LRMSSubmissionTime'} = &convert_date( $submittime, $CLASSAD ) if $submittime;
+        $res{'LRMSStartRunningTime'} = ( $starttime ? &convert_date( $starttime, $CLASSAD ) : '' );
+        $res{'statuschange'} = &convert_date( ( $starttime || $submittime || 0 ), $CLASSAD );
+        
+        if ( $GETWORKERNODE && $res{'JobStatus'} == BLAH_RUNNING ) {
+            my $qname = $job->field( 'queue_name' ) || $job->parent->field('name');
+            $res{'WorkerNode'} = $1 if $qname =~ /\@(.+)$/;
+        }
+    }
+    
+    $results[ ( defined( $jl ) ? $jl->[0] : $index++ ) ] = \%res;
+
+    # Prevents scrip to work in XML::Twig 3.26    
+    #    $twig->dispose;
+    1;
+}
+
+sub lookup_group {
+    my ( $login ) = @_;
+    
+    return $group_cache{$login} if defined( $group_cache{$login} );
+
+    my $gid = $passwd_file_cache{$login};
+
+    if ( ! defined( $gid ) ) {
+	    my @pw = ( getpwnam $login );
+	
+        push( @OS, [ 'getpwnam', $login, @pw ] );
+        
+        $gid = $passwd_file_cache{$login} = defined( $pw[3] ) ? $pw[3] : -1;
+    }
+
+    my $group = $group_file_cache{$gid};
+
+    if ( ! defined( $group ) ) {
+        $group = getgrgid( $gid );
+
+        push( @OS, [ 'getgrgid', $gid, $group ] );
+        
+        $group = 'NoGroup' unless defined( $group );
+
+        $group_file_cache{$gid} = $group;
+    }
+
+    $group_cache{$login} = $group;
+}
+
+sub lookup_queue {
+    my ( $cell, $job, $group ) = @_;
+
+    foreach my $qname ( @VQUEUES ) {
+        my $failed = '';
+
+        foreach my $k ( keys( %{$VQUEUE{$qname}} ) ) {
+            my $v = $VQUEUE{$qname}->{$k};
+
+            if ( $k eq 'queue' ) {
+                $failed = "queue" if $v ne '*' && $job->field('hard_req_queue') ne $v;
+            } 
+            elsif ( $k =~ /^[hs]_(rt|cpu)$/ ) {
+                my ( $r ) = $job->get_xpath('hard_request[@name="'.$k.'"]', 0);
+                $failed = $k if $r && $r->text && $r->text > $v;
+            } 
+            else {
+                $failed = 'unknown';
+            }
+        }
+        
+        return $qname unless $failed;
+    }
+    
+    my $qname = $job->field('queue_name');
+
+    $qname = $job->parent->field('name') unless $qname || $job->parent->gi ne 'Queue-List';
+    $qname = $job->field('hard_req_queue') unless $qname;
+    $qname = $job->field('soft_req_queue') unless $qname;
+    $qname = $VO_TO_QUEUE{$VO_FROM_GROUP{$group}||$group};
+    $qname = '*' unless $qname;
+    
+    $qname =~ s/\@.*//;
+    $qname;
+}
+
+sub lookup_maxwalltime {
+    my ( $cell, $job, $qname ) = @_;
+
+    my $maxwalltime = $QUEUE_maxwalltime{$qname};
+    
+    my ( @e ) = ( $job->get_xpath( 'hard_request[@name="h_rt" or @name="s_rt"]' ) );
+
+    push( @e, $job->get_xpath( 'def_hard_request[@name="h_rt" or @name="s_rt"]' ) );
+    push( @e, $job->get_xpath( 'soft_request[@name="h_rt" or @name="s_rt"]' ) );
+    push( @e, $job->get_xpath( 'def_soft_request[@name="h_rt" or @name="s_rt"]' ) );
+
+    push( @e, $job->parent->get_xpath( 'resource[@name="h_rt" or @name="s_rt"]' ) )
+	if $job->parent->gi eq 'Queue-List';
+
+    foreach my $e ( @e ) {
+        die unless $e;
+        my $t = &timeperiod( $e->text );
+        $maxwalltime = $t if defined( $t ) && ( ( ! defined( $maxwalltime ) ) || ( $t < $maxwalltime ) );
+    }
+    
+    $maxwalltime = $CONFIG{'default_duration'} unless defined( $maxwalltime );
+
+    return $maxwalltime;
+}
+
+sub lookup_jobstate {
+    my ( $job ) = @_;
+    my $jobstatus = $job->field('state');
+
+    ( $jobstatus =~ /h/      ? BLAH_HELD
+      : $jobstatus =~ /d/    ? BLAH_DELETED
+      : $jobstatus =~ /E/    ? BLAH_FINISHED
+      : $jobstatus =~ /[rt]/ ? BLAH_RUNNING
+      : $jobstatus =~ /q/    ? BLAH_QUEUED
+      : 0 
+    );
+}
+
+sub process_queue {
+    my ( $cell, $twig, $queue ) = @_;
+
+    my $instname = $queue->field('name');
+    my $qstate   = $queue->field('state') || '';
+
+    if ( $instname =~ /^([^\@]+)\@(.+)$/ ) {
+        my $qname    = $1;
+        my $hostname = $2;
+        my $wallclocktime;
+        my $cputime;
+
+        return 0 if defined( $CONFIG{'queue_include_regexp'} ) && ( $instname !~ /$CONFIG{'queue_include_regexp'}/o );
+        return 0 if defined( $CONFIG{'queue_exclude_regexp'} ) && ( $instname =~ /$CONFIG{'queue_exclude_regexp'}/o );
+
+        foreach my $e1 ( $queue->get_xpath( 'resource[@name="h_rt" or @name="s_rt"]' ) ) {
+            my $t1 = &timeperiod( $e1->text );
+            
+            $wallclocktime = $t1 if defined( $t1 ) && ( ! $wallclocktime || $t1 < $wallclocktime );
+        }
+
+        foreach my $e2 ( $queue->get_xpath( 'resource[@name="h_cpu" or @name="s_cpu"]' ) ) {
+            my $t2 = &timeperiod( $e2->text );
+            
+            $cputime = $t2 if defined( $t2 ) && ( ! $cputime || $t2 < $cputime );
+        }
+
+        my $max_cpu   = $queue->field('slots_total');
+        my $used_cpu  = $queue->field('slots_used');
+        
+        $max_cpu -= $used_cpu if ( $SGE{$cell}->{'version'} || '' ) =~ /^6\.1u[34]$/;
+        
+        my $total_cpu = ( ( $qstate =~ /[udEs]/ ) ? 0 : $max_cpu );
+
+        my $slots = $queue->get_xpath('resource[@name="slots"]', 0 );
+        my $free_slots = ( $qstate !~ /[uadEs]/ ) && $slots ? $slots->text : 0;
+
+        $USED_cpus += $used_cpu;
+        $HOST_freecpus{$hostname} = $free_slots if ( $free_slots >= ( $HOST_freecpus{$hostname} || 0 ) );
+        
+        my ( @queues ) = ( @VQUEUES ? grep( &match_queue( $_, $qname, $queue ), @VQUEUES ) : ( $qname ) );
+
+        foreach my $q ( @queues, '*' ) {
+            $QUEUE_minlimits{$q}->{'rt'} = &minval( $QUEUE_minlimits{$q}->{'rt'}, $wallclocktime );
+            $QUEUE_minlimits{$q}->{'cpu'} = &minval( $QUEUE_minlimits{$q}->{'cpu'}, $cputime );
+            $QUEUE_maxwalltime{$q} = &maxval( $QUEUE_maxwalltime{$q}, $wallclocktime );
+
+            if ( my $qc = $QUEUE_counts{$q}->{$hostname} ) {
+                $qc->[0] = &maxval( $qc->[0], $max_cpu );
+                $qc->[1] = &maxval( $qc->[1], $total_cpu );
+                $qc->[2] = &maxval( $qc->[2], $free_slots );
+            } 
+            else {
+                $QUEUE_counts{$q}->{$hostname} = [ $max_cpu, $total_cpu, $free_slots ];
+            }
+        }
+    }
+
+    # Prevents scrip to work in XML::Twig 3.26 
+    #    $twig->dispose;
+    1;
+}
+
+sub match_queue {
+    my ( $vqname, $qname, $queue ) = @_;
+    my $failed = '';
+
+    foreach my $k ( keys( %{$VQUEUE{$vqname}} ) ) {
+        my $v = $VQUEUE{$vqname}->{$k};
+
+        if ( $k eq 'queue' ) {
+            $failed = "queue" if $v ne '*' && $qname ne $v;
+        } 
+        elsif ( $k =~ /^[hs]_(rt|cpu)$/ ) {
+            my $r = &timeperiod( $queue->get_xpath('resource[@name="'.$k.'"]', 0)->text );
+            
+            $failed = $k if defined( $r ) && $v > $r;
+        } 
+        else {
+            $failed = 'unknown';
+        }
+        last if $failed;
+    }
+
+    ! $failed;
+}
+
+sub quote {
+    $_[0];
+}
+
+
+# Convert <days>:<hours>:<mins>:<secs>, <hours>:<mins>:<secs>, <mins>:<secs> and <secs>
+# to seconds
+#
+# "infinity" and "none" are both converted to arg2
+#
+sub timeperiod {
+    ( $_[0] =~ /^(\d+)\:(\d+)\:(\d+)\:(\d+)$/ ) ? ( ( ( $1 * 24 ) + $2 ) * 60 + $3 ) * 60 + $4
+       : ( $_[0] =~ /^(\d+)\:(\d+)\:(\d+)$/ )   ? ( ( $1 * 60 ) + $2 ) * 60 + $3
+       : ( $_[0] =~ /^(\d+)\:(\d+)$/ )          ? ( $1 * 60 ) + $2
+       : ( $_[0] =~ /^(\d+)$/ )                 ? $1
+       : $_[1];
+}
+
+
+sub read_vqueue_file {
+    # The rest of the code will work quite happily without VQUEUES if required
+    my $filename = $CONFIG{'vqueue_file'};
+
+    if ( defined( $filename ) && $filename ne '/dev/null' ) {
+        open( VQUEUES, $filename ) or die "cannot open $filename containing vqueue definitions: $!\n";
+
+        while ( <VQUEUES> ) {
+            s/^\s+//; s/\s+$//; s/\#.*//;
+            
+            next if /^$/;
+            
+            if ( /^(\S+)\s+(\S+)\s+(\S+)$/ ) {
+                my ( $qname, $property, $value ) = ( $1, $2, $3 );
+
+                if ( $property =~ /^max\_(wall|cpu)\_time$/ ) {
+                    my $type = ( $1 eq 'wall' ? 'rt' : 'cpu' );
+                    $property = 'h_'.$type;
+                    $value    = &timeperiod( $value, 0 ) * 60;
+                    $QUEUE_minlimits{$qname}->{$type} = &minval( $QUEUE_minlimits{$qname}->{$type}, $value );
+                    $NEEDED_RESOURCEINFO{$property}++;
+                } elsif ( $property =~ /^([hs]\_(cpu|rt))$/ ) {
+                    my $type = $2;
+                    $value = &timeperiod( $value );
+                    $QUEUE_minlimits{$qname}->{$type} = &minval( $QUEUE_minlimits{$qname}->{$type}, $value );
+                    $NEEDED_RESOURCEINFO{$property}++;
+                }
+
+                push( @VQUEUES, $qname ) unless $VQUEUE{$qname};
+
+                $VQUEUE{$qname}->{$property} = $value;
+            } 
+            else {
+                printf( STDERR "unrecognised entry in %s\n%s\n",
+                $CONFIG{'vqueue_file'},
+                $_ );
+            }
+        }
+        
+        close( VQUEUES );
+        
+        if ( @VQUEUES ) {
+            # Add any queues referenced by the static ldif file that were not defined in the vqueues file
+            
+            foreach ( @DNs ) {
+                next if $VQUEUE{$_->[1]};
+                
+                push( @VQUEUES, $_->[1] );
+                $VQUEUE{$_->[1]}->{'queue'} = $_->[1];
+            }
+        }
+    }
+}
+
+
+# Read the static ldif file...
+
+# NOTE: We need currently two bits of information from this file:
+# 
+# 1. A list of DNs that indicate the queues we need to report on when
+#    running as "lcg-info-dynamic-sge"
+#
+# 2. A list of which VOs are meant to have access to which queues
+#    in order to return sensible values when running as "vomaxjobs-sge"
+
+sub read_ldif_file {
+    my ($filename) = @_; 
+
+    my $enable_vqueues;
+
+    open( LDIFFILE, $filename ) 
+	or die "cannot open ".$filename.": $!\n";
+   
+    my $savedn;
+    while( <LDIFFILE> ) {
+       
+        ## GLUE1 ##
+        if ( /^(dn\:\s*GlueCEUniqueID\=\S+\/(jobmanager|blah|cream)\-(lcgsge|sge)\-([^\,\s]+)\,.+)$/ ) {
+            push( @DNs, [ $1, $4 ] );
+            $enable_vqueues = 1 if $3 eq 'sge';
+        } 
+        elsif ( /^dn\:\s*GlueVOViewLocalID\=([^\s\,\.]+((?:\.[^\s\,\.]+)*))\,GlueCEUniqueID\=\S+\/(jobmanager|blah|cream)\-(lcgsge|sge)\-([^\,\s]+)\,.+$/ ) {
+            $VO_TO_QUEUE{$1} = $5;
+            $QUEUE_vos{$5}->{$1}++;
+            $VO_queues{$1}->{$5}++;
+            $VOGROUPS{$1}->{$1}++ unless $2;
+        }
+
+        ## GLUE2 ##
+        if ( /dn:\s+GLUE2ManagerId=/ ) {
+            push @ManagerDNs, $_;
+        }
+
+        if ( /dn:\s+GLUE2ShareID=/ ) {
+            $savedn = $_;
+        } 
+        else {
+            if ( /GLUE2ComputingShareMappingQueue:/ ) {
+                my $que = $_;
+                $que =~ s/GLUE2ComputingShareMappingQueue://;
+                $que =~ s/^\s+//;
+                $que =~ s/\s+$//;
+                chomp $que;
+                push( @ShareDNs, [ $savedn, $que ] );
+            }
+        }
+    }
+
+    close( LDIFFILE );
+    
+    $CONFIG{'vqueue_file'} = $DEFAULT_VQUEUE_FILE if $enable_vqueues && ! defined( $CONFIG{'vqueue_file'} );
+}
+
+
+sub get_sge_version {
+    my ( $cell ) = @_;
+    my ( $version );
+
+    my $qstatinfo = &run_sge_command( $cell, '2>&1', 'qstat', '-help' );
+
+    while( defined( $_ = $qstatinfo->getline ) ) {
+        $SGE{$cell}->{'version'} = $2 if ! $version && /^(OGS\/)?S?GE (\S+)$/;
+    }
+
+    $qstatinfo->close;
+}
+
+sub get_sge_settings {
+    my ( $cell ) = @_;
+
+    my $qconfdata = &run_sge_command( $cell, undef, 'qconf', '-sconf' );
+    
+    while( defined( $_ = $qconfdata->getline ) ) {
+        if ( /^max_jobs\s+(\d+)$/ ) {
+            $SGE{$cell}->{'max_jobs'} = $1;
+        }
+    }
+
+    $qconfdata->close;
+}
+
+# Given the path to the local configuration file, extracts all of the 
+# configuration information we're interested in.
+
+# This parses config files in a variety of formats including the
+# original format used by earlier versions of lcg-info-dynamic-sge
+# and the format used by lcg-info-dynamic-scheduler
+
+sub read_config_file {
+    my ($filename) = @_;	# Path to the configuration file.
+    
+    # We have been given a config file so don't try reading the default one
+    
+    my $section;
+    my $vomap;
+
+    # Open the file.
+    my $config = new IO::File( $filename, "r" ) or die "Unable to open configuration file $filename: $!";
+    
+    $FILEPROCESSED{$filename}++;
+
+    my $lineno = 0;
+
+    # For every config file entry:
+    while( defined( $_ = $config->getline ) ) {
+        $lineno++;
+
+        # Trim comments
+        s/\#.*//;
+        s/^\s*\;.*//;
+        
+        # Trim trailing whitespace
+        s/\s+$//;
+
+        if ( /^\[(\w+)\]$/ ) {
+            # If we spot a win ini style section, then switch to processing alternative file format
+            # Add assume that we no longer need to read the config file from the default location
+            $DEFAULT_LRMS_CONFIG_FILE = undef;
+            $section = "\L$1";
+            $vomap   = 0;
+            next;
+        }
+
+        if ( defined( $section ) ) {
+            if ( $section eq 'main' && /^vomap\s*[\:\=]\s*$/ ) {
+                $vomap = 1;
+                next;
+            } 
+            elsif ( $vomap && /^\s+([^\:\s]{1,32})\s*[\:\=]\s*(?:\/VO\=)?([^\/\s]+)/ ) {
+                $VOGROUPS{$2}->{$1}++;
+                $VO_FROM_GROUP{$1} = $2;
+                next;
+            }
+            
+            $vomap = 0;
+            
+            if ( $section eq 'main' && /^static_ldif_file\s*[\:\=]\s*(\S+)$/ ) {
+                $CONFIG{'glue1-static-file-ce'} = $1;
+            }
+            next;
+        }
+
+            # Trim leading whitespace
+        s/^\s+//;
+        
+        # Skip blank links
+        next if /^$/;
+        
+        # IF we reach here, then we have found a traditional SGE information provider style
+        # config file,  therefore we don't need to read the file from the default location
+
+        $DEFAULT_CONFIG_FILE = undef;
+        # Split into key/value pair
+        # Allowing formats:
+        #    key value
+        #    key=value
+        #    key = value
+        # "key" is case insignificant
+        # "value" is optionally enclosed in quotes,  though this doesn't currently
+        # make any difference as to how the value is interpreted   (other than
+        # allowing the possibility of leading/trailing whitespace)
+        
+        my ( $k, $v ) = split( /[\s\=]+/, $_, 2 );
+        
+        $k = "\L$k";
+        $v =~ s/^\"(.*)\"$/$1/;
+        
+        &process_config_entry( $k, $v, "$filename line $lineno" );
+    }
+    
+    $config->close;
+}
+
+
+# Process individual configfile/commandline entry
+# This is called from either processConfig or by Getopt::Long::GetOptions
+
+sub process_config_entry {
+    my ( $k, $v, $from ) = @_;
+    
+    if    ( $k eq 'default_duration'                  ) { $CONFIG{$k} = timeperiod( $v ); }
+    elsif ( $k =~ /^sge_(root|arch|cell)$/            ) { $ENV{"\U$k"} = $v; }
+    elsif ( $k eq 'setenv' && $v =~ /^([^=]+)\=(.*)$/ ) { $ENV{$1} = $2; }
+    elsif ( $k eq 'debug_time' || $k eq 'time'        ) { $CONFIG{'time'} = $v; }
+    elsif ( $k eq 'group' && $v =~ /^([^=]+)\=(.*)$/  ) { $VO_FROM_GROUP{$1} = $2; }
+    elsif ( $k eq 'login' && $v =~ /^([^=]+)\=(.*)$/  ) { $VO_FROM_LOGIN{$1} = $2; }
+    elsif ( $k eq 'config'                            ) { &process_config( $v ) unless $FILEPROCESSED{$v}; }
+    elsif ( exists( $CONFIG{$k} )                     ) { $CONFIG{$k} = $v; }
+    elsif ( $IGNORECONFIG{$k}                         ) { 1; }
+    else                                                { die "unrecognised configuration entry $from: $k=$v"; }
+}
+
+
+sub read_clusterstate_file {
+    my $filename = $CONFIG{'state_file'};
+
+    return unless defined( $filename );
+
+    my $statefile = new IO::File( $CONFIG{'state_file'}, "r" );
+    if ( $statefile ) {
+        while( defined( $_ = $statefile->getline ) ) {
+            $CONFIG{'clusterstate'} = $1 if /^\s*(Production|Queueing|Draining|Closed)\s*$/;
+        }
+        $statefile->close;
+    }
+}
+
+sub maxval {
+    defined( $_[0] ) && ( ! defined( $_[1] ) || $_[0] > $_[1] ) ? $_[0] : $_[1];
+}
+
+sub minval {
+    defined( $_[0] ) && ( ! defined( $_[1] ) || $_[0] < $_[1] ) ? $_[0] : $_[1];
+}
+
+#
+# Caching mechanism
+#
+
+sub qstat_to_file {
+    my ( $fname, $data ) = @_;
+    
+    open (QSTAT_FH, '>', $fname);
+    print QSTAT_FH $data;    
+    close (QSTAT_FH);
+}
+
+sub get_qstat_data {
+    my ( $cell, $do_caching, $needed_resourceinfo ) = @_;
+    my $xmlref = XML::Twig->new(
+        'twig_roots' => { 
+            'job_list'   => ( $LRMS ? sub { &gen_lrmsinfo( $cell, @_ ); } : sub { &gen_classad( $cell, @_ ); } ),
+            'Queue-List' => sub { &process_queue( $cell, @_ ); }
+        } 
+    );
+    my $cmd_base = "$CONFIG{'qstat_command'} -xml -f -u '*' -r"; 
+    my $cmd = $needed_resourceinfo ? sprintf( "%s -F %s", $cmd_base, $needed_resourceinfo ) : $cmd_base;
+    my $fname = undef;
+    my $mtime = undef;
+
+    if ( $do_caching ) {
+        use File::stat;
+    
+        $fname = "$CONFIG{'cache_dir'}/qstat.$cell.xml";
+        $mtime = stat( $fname )->mtime if -e $fname;
+    }
+    
+    my $data = `$cmd`;
+    &qstat_to_file( $fname, $data ) unless ( $mtime && (time() - $mtime) < $CONFIG{'cache_expiration'} );
+    
+    $do_caching ? $xmlref->safe_parsefile( $fname ) : $xmlref->parse( $data );
+}
